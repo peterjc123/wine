@@ -2291,6 +2291,24 @@ static NTSTATUS wow64_wg_parser_push_data(void *args) {
     return wg_parser_push_data(&params);
 }
 
+static NTSTATUS wow64_wg_parser_connect(void *args)
+{
+    struct
+    {
+        wg_parser_t parser;
+        PTR32 uri;
+        UINT64 file_size;
+    } *params32 = args;
+    struct wg_parser_connect_params params =
+    {
+        .parser = params32->parser,
+        .file_size = params32->file_size,
+        .uri = ULongToPtr(params32->uri),
+    };
+
+    return wg_parser_connect(&params);
+}
+
 static NTSTATUS wow64_wg_parser_stream_get_preferred_format(void *args)
 {
     struct
@@ -2329,11 +2347,13 @@ static NTSTATUS wow64_wg_parser_stream_enable(void *args)
     {
         wg_parser_stream_t stream;
         PTR32 format;
+        UINT32 flags;
     } *params32 = args;
     struct wg_parser_stream_enable_params params =
     {
         .stream = params32->stream,
         .format = ULongToPtr(params32->format),
+        .flags = params32->flags,
     };
 
     return wg_parser_stream_enable(&params);
@@ -2400,6 +2420,7 @@ NTSTATUS wow64_wg_source_create(void *args)
     struct
     {
         PTR32 url;
+        UINT64 file_size;
         PTR32 data;
         UINT32 size;
         char mime_type[256];
@@ -2408,6 +2429,7 @@ NTSTATUS wow64_wg_source_create(void *args)
     struct wg_source_create_params params =
     {
         .url = ULongToPtr(params32->url),
+        .file_size = params32->file_size,
         .data = ULongToPtr(params32->data),
         .size = params32->size,
     };
@@ -2640,7 +2662,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     X(wg_parser_create),
     X(wg_parser_destroy),
 
-    X(wg_parser_connect),
+    X64(wg_parser_connect),
     X(wg_parser_disconnect),
 
     X(wg_parser_get_next_read_offset),
