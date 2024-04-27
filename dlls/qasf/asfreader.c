@@ -18,6 +18,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <stdbool.h>
+
 #include "qasf_private.h"
 
 #include "mediaobj.h"
@@ -344,10 +346,145 @@ static ULONG WINAPI media_seeking_Release(IMediaSeeking *iface)
 static HRESULT WINAPI media_seeking_SetPositions(IMediaSeeking *iface,
         LONGLONG *current, DWORD current_flags, LONGLONG *stop, DWORD stop_flags)
 {
+    // copy GST_Seeking_SetPositions@quartz_parser.c here
+    struct asf_stream *stream = impl_from_IMediaSeeking(iface);
+    struct asf_reader *filter = asf_reader_from_asf_stream(stream);
+    int i;
+    struct strmbase_source *source;
+    HRESULT hr;
+
+    FILTER_STATE state, prev_state;
+
+
     FIXME("iface %p, current %s, current_flags %#lx, stop %s, stop_flags %#lx stub!\n",
             iface, current ? debugstr_time(*current) : "<null>", current_flags,
             stop ? debugstr_time(*stop) : "<null>", stop_flags);
-    return SourceSeekingImpl_SetPositions(iface, current, current_flags, stop, stop_flags);
+
+    EnterCriticalSection(&filter->filter.filter_cs);
+
+    state = filter->filter.state;
+
+    LeaveCriticalSection(&filter->filter.filter_cs);
+
+    TRACE("current state: %d, filter state: %d\n", state, filter->status);
+
+    // typedef enum WMT_STATUS
+    // {
+    //     WMT_ERROR                       =  0,
+    //     WMT_OPENED                      =  1,
+    //     WMT_BUFFERING_START             =  2,
+    //     WMT_BUFFERING_STOP              =  3,
+    //     WMT_EOF                         =  4,
+    //     WMT_END_OF_FILE                 =  4,
+    //     WMT_END_OF_SEGMENT              =  5,
+    //     WMT_END_OF_STREAMING            =  6,
+    //     WMT_LOCATING                    =  7,
+    //     WMT_CONNECTING                  =  8,
+    //     WMT_NO_RIGHTS                   =  9,
+    //     WMT_MISSING_CODEC               = 10,
+    //     WMT_STARTED                     = 11,
+    //     WMT_STOPPED                     = 12,
+    //     WMT_CLOSED                      = 13,
+    //     WMT_STRIDING                    = 14,
+    //     WMT_TIMER                       = 15,
+    //     WMT_INDEX_PROGRESS              = 16,
+    // } WMT_STATUS;
+
+    // typedef enum _FilterState {
+    //     State_Stopped = 0,
+    //     State_Paused = 1,
+    //     State_Running = 2
+    // } FILTER_STATE;
+
+    if (filter->status == WMT_STOPPED && state == State_Stopped)
+    {
+        SourceSeekingImpl_SetPositions(iface, current, current_flags, stop, stop_flags);
+        return S_OK;
+    }
+
+    SourceSeekingImpl_SetPositions(iface, current, current_flags, stop, stop_flags);
+
+    struct {
+        double dRate;
+        LONGLONG llCurrent, llStop;
+        DWORD current_flags, stop_flags;
+        bool eos;
+    } data;
+
+    data.dRate = stream->seek.dRate;
+    data.llCurrent = stream->seek.llCurrent;
+    data.llStop = stream->seek.llStop;
+    data.current_flags = current_flags;
+    data.stop_flags = stop_flags;
+    data.eos = filter->status == WMT_EOF;
+
+    EnterCriticalSection(&filter->status_cs);
+    if (state == State_Paused && 
+        ((data.stop_flags & AM_SEEKING_PositioningBitsMask) == AM_SEEKING_NoPositioning) &&
+        filter->status != WMT_EOF
+    )
+    {   
+        // This should be an actual pause
+        if (SUCCEEDED(hr = IWMReader_Pause(filter->reader)))
+        {
+            filter->status = -1;
+            while (filter->status != WMT_STOPPED)
+                SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
+            hr = filter->result;
+        }
+    }
+    else if (state == State_Running &&
+        ((data.stop_flags & AM_SEEKING_PositioningBitsMask) == AM_SEEKING_NoPositioning) &&
+        filter->status != WMT_EOF
+    )
+    {   
+        // This should be an actual resume
+        if (SUCCEEDED(hr = IWMReader_Resume(filter->reader)))
+        {
+            filter->status = -1;
+            while (filter->status != WMT_STARTED)
+                SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
+            hr = filter->result;
+        }
+    }
+    else 
+    {
+        if (!(current_flags & AM_SEEKING_NoFlush))
+        {
+            for (i = 0; i < filter->stream_count; ++i)
+            {
+                source = &filter->streams[i].source;
+                if (source->pin.peer)
+                    IPin_BeginFlush(source->pin.peer);
+            }
+        }
+
+        // Should be either EOF or actual seeking
+        if (SUCCEEDED(hr = IWMReader_Start(filter->reader, 0, 0, 1, (void *)&data)))
+        {
+            filter->status = -1;
+            while (filter->status != WMT_STARTED)
+                SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
+            hr = filter->result;
+        }
+
+        if (!(current_flags & AM_SEEKING_NoFlush))
+        {
+            for (i = 0; i < filter->stream_count; ++i)
+            {
+                source = &filter->streams[i].source;
+                if (source->pin.peer)
+                    IPin_EndFlush(source->pin.peer);
+            }
+        }
+    }
+
+    LeaveCriticalSection(&filter->status_cs);
+
+    if (FAILED(hr))
+        WARN("Failed to start WMReader %p, hr %#lx\n", filter->reader, hr);
+
+    return hr;
 }
 
 static const IMediaSeekingVtbl media_seeking_vtbl =
@@ -869,6 +1006,13 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
             }
             break;
 
+        case WMT_EOF:
+            EnterCriticalSection(&filter->status_cs);
+            filter->result = result;
+            filter->status = WMT_EOF;
+            LeaveCriticalSection(&filter->status_cs);
+            WakeConditionVariable(&filter->status_cv);
+            break;
         case WMT_STARTED:
             EnterCriticalSection(&filter->status_cs);
             filter->result = result;

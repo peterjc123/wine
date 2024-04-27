@@ -46,6 +46,13 @@ union async_op_data
     } start;
 };
 
+struct async_start_context {
+    double dRate;
+    LONGLONG llCurrent, llStop;
+    DWORD current_flags, stop_flags;
+    bool eos;
+};
+
 struct async_op
 {
     enum async_op_type
@@ -53,6 +60,8 @@ struct async_op
         ASYNC_OP_START,
         ASYNC_OP_STOP,
         ASYNC_OP_CLOSE,
+        ASYNC_OP_PAUSE,
+        ASYNC_OP_RESUME,
     } type;
     union async_op_data u;
     struct list entry;
@@ -107,6 +116,7 @@ struct async_reader
     void *context;
 
     REFERENCE_TIME clock_start;
+    REFERENCE_TIME paused_clock_diff;
     LARGE_INTEGER clock_frequency;
 
     HANDLE callback_thread;
@@ -623,17 +633,49 @@ static DWORD WINAPI async_reader_callback_thread(void *arg)
                 case ASYNC_OP_START:
                 {
                     reader->context = op->u.start.context;
+                    if (SUCCEEDED(hr)) {
+                        if (reader->context) {
+                            if (reader->running && list_empty(&reader->async_ops)) {
+                                bool should_wait = false;
+                                for (i = 0; i < reader->stream_count; ++i)
+                                {
+                                    struct stream *stream = reader->streams + i;
+                                    if (stream->read_result == E_PENDING) {
+                                        should_wait = true;
+                                        break;
+                                    }
+                                }
+                                if (should_wait) {
+                                    SleepConditionVariableCS(&reader->callback_cv, &reader->callback_cs, INFINITE);
+                                }
+                            }
+                            hr = IWMSyncReader2_SetOutputSetting(reader->reader, 0, L"SeekingData", WMT_TYPE_QWORD,
+                                    (BYTE *)reader->context, sizeof(*reader->context) );
+                        } else {
+                            hr = IWMSyncReader2_SetRange(reader->reader, op->u.start.start, op->u.start.duration);
+                        }
+                    }
+                        
                     if (SUCCEEDED(hr))
-                        hr = IWMSyncReader2_SetRange(reader->reader, op->u.start.start, op->u.start.duration);
-                    if (SUCCEEDED(hr))
-                    {
-                        reader->clock_start = get_current_time(reader);
+                    {   
+                        bool should_reset = true;
+                        if (reader->context) {
+                            struct async_start_context *ctx = (struct async_start_context *)reader->context;
+                            TRACE("async_start_context eos: %d\n", (int)ctx->eos);
+                            if (!ctx->eos) {
+                                should_reset = false;
+                            }
+                        }
 
-                        for (i = 0; i < reader->stream_count; ++i)
-                        {
-                            struct stream *stream = reader->streams + i;
-                            stream_flush_samples(stream);
-                            stream_request_read(stream);
+                        if (should_reset) {
+                            reader->clock_start = get_current_time(reader);
+
+                            for (i = 0; i < reader->stream_count; ++i)
+                            {
+                                struct stream *stream = reader->streams + i;
+                                stream_flush_samples(stream);
+                                stream_request_read(stream);
+                            }
                         }
                     }
 
@@ -645,8 +687,10 @@ static DWORD WINAPI async_reader_callback_thread(void *arg)
                 }
 
                 case ASYNC_OP_STOP:
-                    if (SUCCEEDED(hr))
+                    if (SUCCEEDED(hr)) {
+                        reader->paused_clock_diff = 0;
                         reader->clock_start = 0;
+                    }
 
                     LeaveCriticalSection(&reader->callback_cs);
                     IWMReaderCallback_OnStatus(reader->callback, WMT_STOPPED, hr,
@@ -662,6 +706,28 @@ static DWORD WINAPI async_reader_callback_thread(void *arg)
 
                     if (SUCCEEDED(hr))
                         reader->running = false;
+                    break;
+                case ASYNC_OP_PAUSE:
+                    if (SUCCEEDED(hr)) {
+                        reader->paused_clock_diff = get_current_time(reader) - reader->clock_start;
+                        reader->clock_start = 0;
+                    }
+
+                    LeaveCriticalSection(&reader->callback_cs);
+                    IWMReaderCallback_OnStatus(reader->callback, WMT_STOPPED, hr,
+                            WMT_TYPE_DWORD, (BYTE *)&zero, reader->context);
+                    EnterCriticalSection(&reader->callback_cs);
+                    break;
+                case ASYNC_OP_RESUME:
+                    if (SUCCEEDED(hr)) {
+                        reader->clock_start = get_current_time(reader) - reader->paused_clock_diff;
+                        reader->paused_clock_diff = 0;
+                    }
+
+                    LeaveCriticalSection(&reader->callback_cs);
+                    IWMReaderCallback_OnStatus(reader->callback, WMT_STARTED, hr,
+                            WMT_TYPE_DWORD, (BYTE *)&zero, reader->context);
+                    EnterCriticalSection(&reader->callback_cs);
                     break;
             }
 
@@ -1010,16 +1076,40 @@ static HRESULT WINAPI WMReader_Stop(IWMReader *iface)
 
 static HRESULT WINAPI WMReader_Pause(IWMReader *iface)
 {
-    struct async_reader *This = impl_from_IWMReader(iface);
-    FIXME("(%p)\n", This);
-    return E_NOTIMPL;
+    struct async_reader *reader = impl_from_IWMReader(iface);
+    HRESULT hr;
+
+    TRACE("reader %p.\n", reader);
+
+    EnterCriticalSection(&reader->cs);
+
+    if (!reader->callback_thread)
+        hr = E_UNEXPECTED;
+    else
+        hr = async_reader_queue_op(reader, ASYNC_OP_PAUSE, NULL);
+
+    LeaveCriticalSection(&reader->cs);
+
+    return hr;
 }
 
 static HRESULT WINAPI WMReader_Resume(IWMReader *iface)
 {
-    struct async_reader *This = impl_from_IWMReader(iface);
-    FIXME("(%p)\n", This);
-    return E_NOTIMPL;
+    struct async_reader *reader = impl_from_IWMReader(iface);
+    HRESULT hr;
+
+    TRACE("reader %p.\n", reader);
+
+    EnterCriticalSection(&reader->cs);
+
+    if (!reader->callback_thread)
+        hr = E_UNEXPECTED;
+    else
+        hr = async_reader_queue_op(reader, ASYNC_OP_RESUME, NULL);
+
+    LeaveCriticalSection(&reader->cs);
+
+    return hr;
 }
 
 static const IWMReaderVtbl WMReaderVtbl = {

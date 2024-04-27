@@ -36,6 +36,13 @@ struct wm_stream
     IWMReaderAllocatorEx *stream_allocator;
 };
 
+struct seek_data {
+    double dRate;
+    long long llCurrent, llStop;
+    unsigned int current_flags, stop_flags;
+    bool eos;
+};
+
 struct wm_reader
 {
     IUnknown IUnknown_inner;
@@ -2399,6 +2406,27 @@ static HRESULT WINAPI reader_SetOutputSetting(IWMSyncReader2 *iface, DWORD outpu
     TRACE("reader %p, output %lu, name %s, type %#x, value %p, size %u.\n",
             reader, output, debugstr_w(name), type, value, size);
 
+    if (!wcscmp(name, L"SeekingData"))
+    {
+        WORD i;
+        struct seek_data *data = (struct seek_data *)value;
+        TRACE("reader %p, current %I64u, current_flags %#lx, stop %I64u, stop_flags %#lx.\n", reader,
+                data->llCurrent, data->current_flags, data->llStop, data->stop_flags);
+
+        EnterCriticalSection(&reader->cs);
+
+        reader->start_time = data->llCurrent;
+
+        wg_parser_stream_seek(reader->streams[0].wg_stream, 1.0, data->llCurrent, data->llStop,
+                data->current_flags, data->stop_flags);
+
+        for (i = 0; i < reader->stream_count; ++i)
+            reader->streams[i].eos = false;
+
+        LeaveCriticalSection(&reader->cs);
+
+        return S_OK;
+    }
     if (!wcscmp(name, L"VideoSampleDurations"))
     {
         FIXME("Ignoring VideoSampleDurations setting.\n");
