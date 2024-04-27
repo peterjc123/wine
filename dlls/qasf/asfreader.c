@@ -368,35 +368,7 @@ static HRESULT WINAPI media_seeking_SetPositions(IMediaSeeking *iface,
 
     TRACE("current state: %d, filter state: %d\n", state, filter->status);
 
-    // typedef enum WMT_STATUS
-    // {
-    //     WMT_ERROR                       =  0,
-    //     WMT_OPENED                      =  1,
-    //     WMT_BUFFERING_START             =  2,
-    //     WMT_BUFFERING_STOP              =  3,
-    //     WMT_EOF                         =  4,
-    //     WMT_END_OF_FILE                 =  4,
-    //     WMT_END_OF_SEGMENT              =  5,
-    //     WMT_END_OF_STREAMING            =  6,
-    //     WMT_LOCATING                    =  7,
-    //     WMT_CONNECTING                  =  8,
-    //     WMT_NO_RIGHTS                   =  9,
-    //     WMT_MISSING_CODEC               = 10,
-    //     WMT_STARTED                     = 11,
-    //     WMT_STOPPED                     = 12,
-    //     WMT_CLOSED                      = 13,
-    //     WMT_STRIDING                    = 14,
-    //     WMT_TIMER                       = 15,
-    //     WMT_INDEX_PROGRESS              = 16,
-    // } WMT_STATUS;
-
-    // typedef enum _FilterState {
-    //     State_Stopped = 0,
-    //     State_Paused = 1,
-    //     State_Running = 2
-    // } FILTER_STATE;
-
-    if (filter->status == WMT_STOPPED && state == State_Stopped)
+    if ((filter->status == WMT_STOPPED || filter->status == WMT_OPENED) && state == State_Stopped)
     {
         SourceSeekingImpl_SetPositions(iface, current, current_flags, stop, stop_flags);
         return S_OK;
@@ -419,63 +391,40 @@ static HRESULT WINAPI media_seeking_SetPositions(IMediaSeeking *iface,
     data.eos = filter->status == WMT_EOF;
 
     EnterCriticalSection(&filter->status_cs);
+    // Ideally we should resume at where we stopped, but let's just seek from start
     if (state == State_Paused && 
         ((data.stop_flags & AM_SEEKING_PositioningBitsMask) == AM_SEEKING_NoPositioning) &&
-        filter->status != WMT_EOF
-    )
-    {   
-        // This should be an actual pause
-        if (SUCCEEDED(hr = IWMReader_Pause(filter->reader)))
-        {
-            filter->status = -1;
-            while (filter->status != WMT_STOPPED)
-                SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
-            hr = filter->result;
-        }
-    }
-    else if (state == State_Running &&
-        ((data.stop_flags & AM_SEEKING_PositioningBitsMask) == AM_SEEKING_NoPositioning) &&
-        filter->status != WMT_EOF
-    )
-    {   
-        // This should be an actual resume
-        if (SUCCEEDED(hr = IWMReader_Resume(filter->reader)))
-        {
-            filter->status = -1;
-            while (filter->status != WMT_STARTED)
-                SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
-            hr = filter->result;
-        }
-    }
-    else 
+        filter->status != WMT_EOF)
     {
-        if (!(current_flags & AM_SEEKING_NoFlush))
-        {
-            for (i = 0; i < filter->stream_count; ++i)
-            {
-                source = &filter->streams[i].source;
-                if (source->pin.peer)
-                    IPin_BeginFlush(source->pin.peer);
-            }
-        }
+        data.llCurrent = 0;
+        data.stop_flags |= AM_SEEKING_AbsolutePositioning;
+    }
 
-        // Should be either EOF or actual seeking
-        if (SUCCEEDED(hr = IWMReader_Start(filter->reader, 0, 0, 1, (void *)&data)))
+    if (!(current_flags & AM_SEEKING_NoFlush))
+    {
+        for (i = 0; i < filter->stream_count; ++i)
         {
-            filter->status = -1;
-            while (filter->status != WMT_STARTED)
-                SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
-            hr = filter->result;
+            source = &filter->streams[i].source;
+            if (source->pin.peer)
+                IPin_BeginFlush(source->pin.peer);
         }
+    }
 
-        if (!(current_flags & AM_SEEKING_NoFlush))
+    if (SUCCEEDED(hr = IWMReader_Start(filter->reader, 0, 0, 1, (void *)&data)))
+    {
+        filter->status = -1;
+        while (filter->status != WMT_STARTED)
+            SleepConditionVariableCS(&filter->status_cv, &filter->status_cs, INFINITE);
+        hr = filter->result;
+    }
+
+    if (!(current_flags & AM_SEEKING_NoFlush))
+    {
+        for (i = 0; i < filter->stream_count; ++i)
         {
-            for (i = 0; i < filter->stream_count; ++i)
-            {
-                source = &filter->streams[i].source;
-                if (source->pin.peer)
-                    IPin_EndFlush(source->pin.peer);
-            }
+            source = &filter->streams[i].source;
+            if (source->pin.peer)
+                IPin_EndFlush(source->pin.peer);
         }
     }
 
